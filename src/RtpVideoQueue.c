@@ -16,12 +16,42 @@
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
 
+// Allow a small adaptive window for late packets to avoid unnecessary frame drops.
+#define RTP_REORDER_DELAY_MIN_US 2000
+#define RTP_REORDER_DELAY_MAX_US 20000
+#define RTP_STASH_PACKET_LIMIT 512
+
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
 
     queue->currentFrameNumber = 1;
     queue->multiFecCapable = APP_VERSION_AT_LEAST(7, 1, 431);
+}
+
+static int processPacketInternal(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length,
+                                 PRTPV_QUEUE_ENTRY packetEntry, bool allowStash);
+
+static uint32_t getAdaptiveReorderDelayUs(void) {
+    uint32_t rttVarianceMs = 0;
+    uint32_t baseDelayMs = (StreamConfig.streamingRemotely == STREAM_CFG_REMOTE) ? 6 : 3;
+
+    if (LiGetEstimatedRttInfo(NULL, &rttVarianceMs)) {
+        uint32_t jitterMs = rttVarianceMs / 2;
+        if (jitterMs > 15) {
+            jitterMs = 15;
+        }
+        baseDelayMs += jitterMs;
+    }
+
+    if (baseDelayMs < (RTP_REORDER_DELAY_MIN_US / 1000)) {
+        baseDelayMs = RTP_REORDER_DELAY_MIN_US / 1000;
+    }
+    if (baseDelayMs > (RTP_REORDER_DELAY_MAX_US / 1000)) {
+        baseDelayMs = RTP_REORDER_DELAY_MAX_US / 1000;
+    }
+
+    return baseDelayMs * 1000;
 }
 
 static void purgeListEntries(PRTPV_QUEUE_LIST list) {
@@ -35,9 +65,17 @@ static void purgeListEntries(PRTPV_QUEUE_LIST list) {
     list->count = 0;
 }
 
+static void clearStashedPackets(PRTP_VIDEO_QUEUE queue) {
+    purgeListEntries(&queue->stashedPackets);
+    queue->hasStashedFrame = false;
+    queue->stashedFrameNumber = 0;
+    queue->stashedBlockNumber = 0;
+}
+
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue) {
     purgeListEntries(&queue->pendingFecBlockList);
     purgeListEntries(&queue->completedFecBlockList);
+    clearStashedPackets(queue);
 }
 
 static void insertEntryIntoList(PRTPV_QUEUE_LIST list, PRTPV_QUEUE_ENTRY entry) {
@@ -87,6 +125,36 @@ static void removeEntryFromList(PRTPV_QUEUE_LIST list, PRTPV_QUEUE_ENTRY entry) 
     entry->prev = NULL;
 
     list->count--;
+}
+
+static void stashPacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY entry, PRTP_PACKET packet, int length,
+                        uint32_t frameIndex, uint8_t fecBlockNumber) {
+    entry->packet = packet;
+    entry->length = length;
+    entry->isParity = false;
+    entry->packetNormalized = false;
+    entry->next = NULL;
+    entry->prev = NULL;
+
+    if (!queue->hasStashedFrame) {
+        queue->hasStashedFrame = true;
+        queue->stashedFrameNumber = frameIndex;
+        queue->stashedBlockNumber = fecBlockNumber;
+    }
+
+    insertEntryIntoList(&queue->stashedPackets, entry);
+}
+
+static void dropStaleStash(PRTP_VIDEO_QUEUE queue) {
+    if (!queue->hasStashedFrame) {
+        return;
+    }
+
+    if (queue->stashedFrameNumber < queue->currentFrameNumber ||
+            (queue->stashedFrameNumber == queue->currentFrameNumber &&
+             queue->stashedBlockNumber < queue->multiFecCurrentBlockNumber)) {
+        clearStashedPackets(queue);
+    }
 }
 
 static void reportFinalFrameFecStatus(PRTP_VIDEO_QUEUE queue) {
@@ -536,11 +604,47 @@ static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
     }
 }
 
+static void drainStashedPackets(PRTP_VIDEO_QUEUE queue) {
+    if (!queue->hasStashedFrame) {
+        return;
+    }
+
+    if (queue->stashedFrameNumber != queue->currentFrameNumber ||
+            queue->stashedBlockNumber != queue->multiFecCurrentBlockNumber) {
+        return;
+    }
+
+    RTPV_QUEUE_LIST stashed = queue->stashedPackets;
+    queue->stashedPackets.head = NULL;
+    queue->stashedPackets.tail = NULL;
+    queue->stashedPackets.count = 0;
+    queue->hasStashedFrame = false;
+    queue->stashedFrameNumber = 0;
+    queue->stashedBlockNumber = 0;
+
+    while (stashed.head != NULL) {
+        PRTPV_QUEUE_ENTRY entry = stashed.head;
+        stashed.head = entry->next;
+
+        entry->next = NULL;
+        entry->prev = NULL;
+
+        if (processPacketInternal(queue, entry->packet, entry->length, entry, false) != RTPF_RET_QUEUED) {
+            free(entry->packet);
+        }
+    }
+}
+
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
-int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+static int processPacketInternal(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length,
+                                 PRTPV_QUEUE_ENTRY packetEntry, bool allowStash) {
+    if (allowStash) {
+        packetEntry->packetNormalized = false;
+    }
+
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         // Reject packets behind our current buffer window
         return RTPF_RET_REJECTED;
@@ -560,10 +664,9 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     }
 
     PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(((char*)packet) + dataOffset);
-
-    nvPacket->streamPacketIndex = LE32(nvPacket->streamPacketIndex);
-    nvPacket->frameIndex = LE32(nvPacket->frameIndex);
-    nvPacket->fecInfo = LE32(nvPacket->fecInfo);
+    uint32_t streamPacketIndex = LE32(nvPacket->streamPacketIndex);
+    uint32_t frameIndex = LE32(nvPacket->frameIndex);
+    uint32_t fecInfo = LE32(nvPacket->fecInfo);
 
     // For legacy servers, we'll fixup the reserved data so that it looks like
     // it's a single FEC frame from a multi-FEC capable server. This allows us
@@ -574,24 +677,51 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     }
 
 #ifndef LC_FUZZING
-    if (isBefore16(nvPacket->frameIndex, queue->currentFrameNumber)) {
+    if (isBefore16(frameIndex, queue->currentFrameNumber)) {
         // Reject frames behind our current frame number
         return RTPF_RET_REJECTED;
     }
 #endif
 
-    uint32_t fecIndex = (nvPacket->fecInfo & 0x3FF000) >> 12;
+    uint32_t fecIndex = (fecInfo & 0x3FF000) >> 12;
     uint8_t fecCurrentBlockNumber = (nvPacket->multiFecBlocks >> 4) & 0x3;
 
-    if (nvPacket->frameIndex == queue->currentFrameNumber && fecCurrentBlockNumber < queue->multiFecCurrentBlockNumber) {
+    if (frameIndex == queue->currentFrameNumber && fecCurrentBlockNumber < queue->multiFecCurrentBlockNumber) {
         // Reject FEC blocks behind our current block number
         return RTPF_RET_REJECTED;
     }
 
     // Reinitialize the queue if it's empty after a frame delivery or
     // if we can't finish a frame before receiving the next one.
-    if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
+    if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != frameIndex ||
             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
+        if (queue->pendingFecBlockList.count != 0 && allowStash && queue->bufferFirstRecvTimeUs != 0) {
+            uint64_t nowUs = PltGetMicroseconds();
+            uint32_t reorderDelayUs = getAdaptiveReorderDelayUs();
+            bool stashNextFrame = frameIndex == queue->currentFrameNumber + 1 && fecCurrentBlockNumber == 0;
+            bool stashNextBlock = frameIndex == queue->currentFrameNumber &&
+                                  fecCurrentBlockNumber > queue->multiFecCurrentBlockNumber;
+            bool stashMatches = !queue->hasStashedFrame ||
+                                (queue->stashedFrameNumber == frameIndex &&
+                                 queue->stashedBlockNumber == fecCurrentBlockNumber);
+
+            if ((stashNextFrame || stashNextBlock) && stashMatches &&
+                    nowUs - queue->bufferFirstRecvTimeUs <= reorderDelayUs &&
+                    queue->stashedPackets.count < RTP_STASH_PACKET_LIMIT) {
+                // Hold future packets briefly to smooth short-lived reordering without adding much latency.
+                stashPacket(queue, packetEntry, packet, length, frameIndex, fecCurrentBlockNumber);
+                return RTPF_RET_STASHED;
+            }
+        }
+
+        // Ensure packet header fields are only converted once.
+        if (!packetEntry->packetNormalized) {
+            nvPacket->streamPacketIndex = streamPacketIndex;
+            nvPacket->frameIndex = frameIndex;
+            nvPacket->fecInfo = fecInfo;
+            packetEntry->packetNormalized = true;
+        }
+
         if (queue->pendingFecBlockList.count != 0) {
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
@@ -608,7 +738,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 // If we just missed a block of this frame rather than the whole thing,
                 // we must manually advance the queue to the next frame. Parsing this
                 // frame further is not possible.
-                if (queue->currentFrameNumber == nvPacket->frameIndex) {
+                if (queue->currentFrameNumber == frameIndex) {
                     // Discard any unsubmitted buffers from the previous frame
                     purgeListEntries(&queue->pendingFecBlockList);
                     purgeListEntries(&queue->completedFecBlockList);
@@ -621,6 +751,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
                     queue->currentFrameNumber++;
                     queue->multiFecCurrentBlockNumber = 0;
+                    dropStaleStash(queue);
                     return RTPF_RET_REJECTED;
                 }
             }
@@ -635,13 +766,13 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
         // We must either start on the current FEC block number for the current frame,
         // or block 0 of a new frame.
-        uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == nvPacket->frameIndex ? queue->multiFecCurrentBlockNumber : 0);
+        uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == frameIndex ? queue->multiFecCurrentBlockNumber : 0);
         if (fecCurrentBlockNumber != expectedFecBlockNumber) {
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
 
             Limelog("Unrecoverable frame %d: lost FEC blocks %d to %d\n",
-                    nvPacket->frameIndex,
+                    frameIndex,
                     expectedFecBlockNumber + 1,
                     fecCurrentBlockNumber);
 
@@ -656,8 +787,9 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             }
 
             // We dropped a block of this frame, so we must skip to the next one.
-            queue->currentFrameNumber = nvPacket->frameIndex + 1;
+            queue->currentFrameNumber = frameIndex + 1;
             queue->multiFecCurrentBlockNumber = 0;
+            dropStaleStash(queue);
             return RTPF_RET_REJECTED;
         }
 
@@ -665,27 +797,27 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         purgeListEntries(&queue->pendingFecBlockList);
 
         // Discard any completed FEC blocks from the previous frame
-        if (queue->currentFrameNumber != nvPacket->frameIndex) {
+        if (queue->currentFrameNumber != frameIndex) {
             purgeListEntries(&queue->completedFecBlockList);
         }
 
         // If the frame numbers are not contiguous, the network dropped an entire frame.
         // The check here looks weird, but that's because we increment the frame number
         // after successfully processing a frame.
-        if (queue->currentFrameNumber != nvPacket->frameIndex) {
-            LC_ASSERT_VT(queue->currentFrameNumber < nvPacket->frameIndex);
+        if (queue->currentFrameNumber != frameIndex) {
+            LC_ASSERT_VT(queue->currentFrameNumber < frameIndex);
 
             // If the frame immediately preceding this one was lost, we may have already
             // reported it using our speculative RFI logic. Don't report it again.
-            if (queue->currentFrameNumber + 1 != nvPacket->frameIndex || !queue->reportedLostFrame) {
+            if (queue->currentFrameNumber + 1 != frameIndex || !queue->reportedLostFrame) {
                 // NB: We only have to notify for the most recent lost frame, since
                 // the depacketizer will report the RFI range starting at the last
                 // frame it saw.
-                notifyFrameLost(nvPacket->frameIndex - 1, false);
+                notifyFrameLost(frameIndex - 1, false);
             }
         }
 
-        queue->currentFrameNumber = nvPacket->frameIndex;
+        queue->currentFrameNumber = frameIndex;
 
         // Tell the control stream logic about this frame, even if we don't end up
         // being able to reconstruct a full frame from it.
@@ -700,8 +832,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         queue->missingPackets = 0;
         queue->useFastQueuePath = true;
         queue->reportedLostFrame = false;
-        queue->bufferDataPackets = (nvPacket->fecInfo & 0xFFC00000) >> 22;
-        queue->fecPercentage = (nvPacket->fecInfo & 0xFF0) >> 4;
+        queue->bufferDataPackets = (fecInfo & 0xFFC00000) >> 22;
+        queue->fecPercentage = (fecInfo & 0xFF0) >> 4;
         queue->bufferParityPackets = (queue->bufferDataPackets * queue->fecPercentage + 99) / 100;
         queue->bufferFirstParitySequenceNumber = U16(queue->bufferLowestSequenceNumber + queue->bufferDataPackets);
         queue->bufferHighestSequenceNumber = U16(queue->bufferFirstParitySequenceNumber + queue->bufferParityPackets - 1);
@@ -710,6 +842,17 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
         queue->stats.packetCountVideo += queue->bufferDataPackets;
         queue->stats.packetCountFec += queue->bufferParityPackets;
+
+        drainStashedPackets(queue);
+        dropStaleStash(queue);
+    }
+
+    // Ensure packet header fields are only converted once.
+    if (!packetEntry->packetNormalized) {
+        nvPacket->streamPacketIndex = streamPacketIndex;
+        nvPacket->frameIndex = frameIndex;
+        nvPacket->fecInfo = fecInfo;
+        packetEntry->packetNormalized = true;
     }
 
     // Reject packets above our FEC queue valid sequence number range
@@ -718,8 +861,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     }
 
     LC_ASSERT_VT(!queue->fecPercentage || U16(packet->sequenceNumber - fecIndex) == queue->bufferLowestSequenceNumber);
-    LC_ASSERT_VT((nvPacket->fecInfo & 0xFF0) >> 4 == queue->fecPercentage);
-    LC_ASSERT_VT((nvPacket->fecInfo & 0xFFC00000) >> 22 == queue->bufferDataPackets);
+    LC_ASSERT_VT((fecInfo & 0xFF0) >> 4 == queue->fecPercentage);
+    LC_ASSERT_VT((fecInfo & 0xFFC00000) >> 22 == queue->bufferDataPackets);
 
     // Verify that the legacy non-multi-FEC compatibility code works
     LC_ASSERT_VT(queue->multiFecCapable || fecCurrentBlockNumber == 0);
@@ -783,6 +926,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             if (queue->multiFecCurrentBlockNumber < queue->multiFecLastBlockNumber) {
                 // Move on to the next FEC block for this frame
                 queue->multiFecCurrentBlockNumber++;
+                drainStashedPackets(queue);
+                dropStaleStash(queue);
             }
             else {
                 // Submit all FEC blocks to the depacketizer
@@ -796,6 +941,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 // Continue to the next frame
                 queue->currentFrameNumber++;
                 queue->multiFecCurrentBlockNumber = 0;
+                drainStashedPackets(queue);
+                dropStaleStash(queue);
             }
         }
 
@@ -803,3 +950,6 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     }
 }
 
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+    return processPacketInternal(queue, packet, length, packetEntry, true);
+}

@@ -51,6 +51,7 @@ typedef struct _PACKET_HOLDER {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
     uint32_t enetPacketFlags;
     uint8_t channelId;
+    uint64_t enqueueTimeMs; // Timestamp for input queue latency stats.
 
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
@@ -92,6 +93,8 @@ static struct {
     bool dirty; // Update ready to send (queued packet holder in packetQueue)
 } currentAbsoluteMouseState;
 
+static INPUT_LATENCY_STATS inputLatencyStats;
+
 // Initializes the input stream
 int initializeInputStream(void) {
     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
@@ -121,6 +124,7 @@ int initializeInputStream(void) {
     memset(currentGamepadSensorState, 0, sizeof(currentGamepadSensorState));
     memset(&currentRelativeMouseState, 0, sizeof(currentRelativeMouseState));
     memset(&currentAbsoluteMouseState, 0, sizeof(currentAbsoluteMouseState));
+    memset(&inputLatencyStats, 0, sizeof(inputLatencyStats));
     PltCreateMutex(&batchedInputMutex);
 
     return 0;
@@ -218,6 +222,7 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
     // Grab an entry from the free list (if available)
     err = LbqPollQueueElement(&packetHolderFreeList, (void**)&holder);
     if (err == LBQ_SUCCESS) {
+        holder->enqueueTimeMs = 0;
         return holder;
     }
     else if (err == LBQ_INTERRUPTED) {
@@ -228,7 +233,109 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
         LC_ASSERT(err == LBQ_NO_ELEMENT);
 
         // Otherwise we'll have to allocate
-        return malloc(sizeof(*holder));
+        holder = malloc(sizeof(*holder));
+        if (holder != NULL) {
+            holder->enqueueTimeMs = 0;
+        }
+        return holder;
+    }
+}
+
+static int queueInputPacket(PPACKET_HOLDER holder) {
+    holder->enqueueTimeMs = PltGetMillis();
+    return LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+}
+
+static void updateInputLatencyStats(PPACKET_HOLDER holder) {
+    if (holder->enqueueTimeMs == 0) {
+        return;
+    }
+
+    uint64_t nowMs = PltGetMillis();
+    if (nowMs < holder->enqueueTimeMs) {
+        return;
+    }
+
+    uint32_t latencyMs = (uint32_t)(nowMs - holder->enqueueTimeMs);
+    uint32_t magic = holder->packet.header.magic;
+
+    inputLatencyStats.totalLatencyMs += latencyMs;
+    inputLatencyStats.packetCount++;
+    if (latencyMs > inputLatencyStats.maxLatencyMs) {
+        inputLatencyStats.maxLatencyMs = latencyMs;
+    }
+
+    if (magic == LE32(MOUSE_MOVE_REL_MAGIC) ||
+        magic == LE32(MOUSE_MOVE_REL_MAGIC_GEN5) ||
+        magic == LE32(MOUSE_MOVE_ABS_MAGIC) ||
+        magic == LE32(MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5) ||
+        magic == LE32(MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5) ||
+        magic == LE32(SCROLL_MAGIC) ||
+        magic == LE32(SCROLL_MAGIC_GEN5) ||
+        magic == LE32(SS_HSCROLL_MAGIC)) {
+        inputLatencyStats.totalMouseLatencyMs += latencyMs;
+        inputLatencyStats.mousePacketCount++;
+        if (latencyMs > inputLatencyStats.maxMouseLatencyMs) {
+            inputLatencyStats.maxMouseLatencyMs = latencyMs;
+        }
+    }
+    else if (magic == LE32(KEY_DOWN_EVENT_MAGIC) ||
+             magic == LE32(KEY_UP_EVENT_MAGIC) ||
+             magic == LE32(UTF8_TEXT_EVENT_MAGIC)) {
+        inputLatencyStats.totalKeyboardLatencyMs += latencyMs;
+        inputLatencyStats.keyboardPacketCount++;
+        if (latencyMs > inputLatencyStats.maxKeyboardLatencyMs) {
+            inputLatencyStats.maxKeyboardLatencyMs = latencyMs;
+        }
+    }
+    else if (magic == LE32(CONTROLLER_MAGIC) ||
+             magic == LE32(MULTI_CONTROLLER_MAGIC) ||
+             magic == LE32(MULTI_CONTROLLER_MAGIC_GEN5) ||
+             magic == LE32(SS_CONTROLLER_ARRIVAL_MAGIC) ||
+             magic == LE32(SS_CONTROLLER_TOUCH_MAGIC) ||
+             magic == LE32(SS_CONTROLLER_MOTION_MAGIC) ||
+             magic == LE32(SS_CONTROLLER_BATTERY_MAGIC)) {
+        inputLatencyStats.totalControllerLatencyMs += latencyMs;
+        inputLatencyStats.controllerPacketCount++;
+        if (latencyMs > inputLatencyStats.maxControllerLatencyMs) {
+            inputLatencyStats.maxControllerLatencyMs = latencyMs;
+        }
+    }
+    else if (magic == LE32(SS_TOUCH_MAGIC)) {
+        inputLatencyStats.totalTouchLatencyMs += latencyMs;
+        inputLatencyStats.touchPacketCount++;
+        if (latencyMs > inputLatencyStats.maxTouchLatencyMs) {
+            inputLatencyStats.maxTouchLatencyMs = latencyMs;
+        }
+    }
+    else if (magic == LE32(SS_PEN_MAGIC)) {
+        inputLatencyStats.totalPenLatencyMs += latencyMs;
+        inputLatencyStats.penPacketCount++;
+        if (latencyMs > inputLatencyStats.maxPenLatencyMs) {
+            inputLatencyStats.maxPenLatencyMs = latencyMs;
+        }
+    }
+    else if (holder->channelId == CTRL_CHANNEL_MOUSE) {
+        inputLatencyStats.totalMouseLatencyMs += latencyMs;
+        inputLatencyStats.mousePacketCount++;
+        if (latencyMs > inputLatencyStats.maxMouseLatencyMs) {
+            inputLatencyStats.maxMouseLatencyMs = latencyMs;
+        }
+    }
+    else if (holder->channelId == CTRL_CHANNEL_KEYBOARD) {
+        inputLatencyStats.totalKeyboardLatencyMs += latencyMs;
+        inputLatencyStats.keyboardPacketCount++;
+        if (latencyMs > inputLatencyStats.maxKeyboardLatencyMs) {
+            inputLatencyStats.maxKeyboardLatencyMs = latencyMs;
+        }
+    }
+    else if (holder->channelId >= CTRL_CHANNEL_GAMEPAD_BASE &&
+             holder->channelId < CTRL_CHANNEL_GAMEPAD_BASE + MAX_GAMEPADS) {
+        inputLatencyStats.totalControllerLatencyMs += latencyMs;
+        inputLatencyStats.controllerPacketCount++;
+        if (latencyMs > inputLatencyStats.maxControllerLatencyMs) {
+            inputLatencyStats.maxControllerLatencyMs = latencyMs;
+        }
     }
 }
 
@@ -366,12 +473,16 @@ static void inputSendThreadProc(void* context) {
         else if (holder->packet.header.magic == relMouseMagicLE) {
             uint64_t now = PltGetMillis();
 
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            // Only delay if we're not already backlogged to avoid extra input latency.
+            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS &&
+                    LbqGetItemCount(&packetQueue) == 0) {
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
             }
+
+            // Capture the full queue-to-send delay, including any batching wait.
+            updateInputLatencyStats(holder);
 
             PltLockMutex(&batchedInputMutex);
 
@@ -437,8 +548,9 @@ static void inputSendThreadProc(void* context) {
         else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
             uint64_t now = PltGetMillis();
 
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            // Only delay if we're not already backlogged to avoid extra input latency.
+            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS &&
+                    LbqGetItemCount(&packetQueue) == 0) {
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
@@ -469,8 +581,9 @@ static void inputSendThreadProc(void* context) {
         else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
             uint64_t now = PltGetMillis();
 
-            // Delay for batching if required
-            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
+            // Only delay if we're not already backlogged to avoid extra input latency.
+            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS &&
+                    LbqGetItemCount(&packetQueue) == 0) {
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
@@ -561,6 +674,9 @@ static void inputSendThreadProc(void* context) {
             // Finally, sleep an additional 50 ms to allow the events to be processed by Windows
             PltSleepMs(50);
 
+            // Capture the input queue delay once for this batched text packet.
+            updateInputLatencyStats(holder);
+
             // We send each Unicode code point individually. This way we can always ensure they will
             // never straddle a packet boundary (which will cause a parsing error on the host).
             while (i < totalLength && !PltIsThreadInterrupted(&inputSendThread)) {
@@ -605,6 +721,9 @@ static void inputSendThreadProc(void* context) {
             continue;
         }
 
+        // Capture the queue-to-send delay for non-batched input packets.
+        updateInputLatencyStats(holder);
+
         // Encrypt and send the input packet
         if (!sendInputPacket(holder, LbqGetItemCount(&packetQueue) > 0)) {
             freePacketHolder(holder);
@@ -637,7 +756,7 @@ static int sendEnableHaptics(void) {
     holder->packet.haptics.header.magic = LE32(ENABLE_HAPTICS_MAGIC);
     holder->packet.haptics.enable = LE16(1);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -703,6 +822,18 @@ int stopInputStream(void) {
     return 0;
 }
 
+int LiGetPendingInputPackets(void) {
+    if (!initialized) {
+        return 0;
+    }
+
+    return LbqGetItemCount(&packetQueue);
+}
+
+const INPUT_LATENCY_STATS* LiGetInputLatencyStats(void) {
+    return &inputLatencyStats;
+}
+
 // Send a mouse move event to the streaming machine
 int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     PPACKET_HOLDER holder;
@@ -751,7 +882,7 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 
         // Remaining fields are set in the input thread based on the latest currentRelativeMouseState values
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = queueInputPacket(holder);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
@@ -811,7 +942,7 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
 
         // Remaining fields are set in the input thread based on the latest currentAbsoluteMouseState values
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = queueInputPacket(holder);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
@@ -872,7 +1003,7 @@ int LiSendMouseButtonEvent(char action, int button) {
     holder->packet.mouseButton.header.magic = LE32(holder->packet.mouseButton.header.magic);
     holder->packet.mouseButton.button = (uint8_t)button;
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -950,7 +1081,7 @@ int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char fla
     holder->packet.keyboard.modifiers = modifiers;
     holder->packet.keyboard.zero2 = 0;
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -985,7 +1116,7 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length) {
     holder->packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
     memcpy(holder->packet.unicode.text, text, length);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -1146,7 +1277,7 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
 
     if (enqueueHolder) {
         // Enqueue the new packet holder
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = queueInputPacket(holder);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
@@ -1230,7 +1361,7 @@ int LiSendHighResScrollEvent(short scrollAmount) {
             holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
             holder->packet.scroll.zero3 = 0;
 
-            err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+            err = queueInputPacket(holder);
             if (err != LBQ_SUCCESS) {
                 LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
                 Limelog("Input queue reached maximum size limit\n");
@@ -1263,7 +1394,7 @@ int LiSendHighResScrollEvent(short scrollAmount) {
         holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
         holder->packet.scroll.zero3 = 0;
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = queueInputPacket(holder);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
@@ -1309,7 +1440,7 @@ int LiSendHighResHScrollEvent(short scrollAmount) {
     holder->packet.hscroll.header.magic = LE32(SS_HSCROLL_MAGIC);
     holder->packet.hscroll.scrollAmount = BE16(scrollAmount);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -1360,7 +1491,7 @@ int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y, fl
     floatToNetfloat(contactAreaMajor, holder->packet.touch.contactAreaMajor);
     floatToNetfloat(contactAreaMinor, holder->packet.touch.contactAreaMinor);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -1413,7 +1544,7 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
     floatToNetfloat(contactAreaMajor, holder->packet.pen.contactAreaMajor);
     floatToNetfloat(contactAreaMinor, holder->packet.pen.contactAreaMinor);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -1453,7 +1584,7 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepa
         holder->packet.controllerArrival.capabilities = LE16(capabilities);
         holder->packet.controllerArrival.supportedButtonFlags = LE32(supportedButtonFlags);
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = queueInputPacket(holder);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
@@ -1504,7 +1635,7 @@ int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType, uint
     floatToNetfloat(y, holder->packet.controllerTouch.y);
     floatToNetfloat(pressure, holder->packet.controllerTouch.pressure);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -1566,7 +1697,7 @@ int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, fl
 
         // Remaining fields are set in the input thread based on the latest currentGamepadSensorState values
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = queueInputPacket(holder);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
@@ -1617,7 +1748,7 @@ int LiSendControllerBatteryEvent(uint8_t controllerNumber, uint8_t batteryState,
     holder->packet.controllerBattery.batteryPercentage = batteryPercentage;
     memset(holder->packet.controllerBattery.zero, 0, sizeof(holder->packet.controllerBattery.zero));
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = queueInputPacket(holder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");

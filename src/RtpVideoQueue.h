@@ -11,6 +11,7 @@ typedef struct _RTPV_QUEUE_ENTRY {
     uint32_t rtpTimestamp;
     int length;
     bool isParity;
+    bool packetNormalized;
 } RTPV_QUEUE_ENTRY, *PRTPV_QUEUE_ENTRY;
 
 typedef struct _RTPV_QUEUE_LIST {
@@ -48,10 +49,16 @@ typedef struct _RTP_VIDEO_QUEUE {
     bool receivedOosData;
 
     RTP_VIDEO_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
+
+    RTPV_QUEUE_LIST stashedPackets;
+    uint32_t stashedFrameNumber;
+    uint8_t stashedBlockNumber;
+    bool hasStashedFrame;
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 
 #define RTPF_RET_QUEUED    0
 #define RTPF_RET_REJECTED  1
+#define RTPF_RET_STASHED   2
 
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);

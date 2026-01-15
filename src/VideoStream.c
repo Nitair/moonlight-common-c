@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include <limits.h>
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -20,19 +21,76 @@ static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
 
-// We can't request an IDR frame until the depacketizer knows
-// that a packet was lost. This timeout bounds the time that
-// the RTP queue will wait for missing/reordered packets.
-#define RTP_QUEUE_DELAY 10
+// Size the socket receive buffer based on bitrate and network conditions so we
+// can absorb short bursts without keeping more data in flight than needed.
+#define RTP_RECV_PACKETS_BUFFERED_DEFAULT 2048
+#define RTP_RECV_PACKETS_BUFFERED_MIN 256
+#define RTP_RECV_PACKETS_BUFFERED_MAX 8192
+#define RTP_RECV_BUFFER_TARGET_LOCAL_MS 120
+#define RTP_RECV_BUFFER_TARGET_REMOTE_MS 200
+#define RTP_RECV_BUFFER_JITTER_CAP_MS 60
 
-// This is the desired number of video packets that can be
-// stored in the socket's receive buffer. 2048 is chosen
-// because it should be large enough for all reasonable
-// frame sizes (probably 2 or 3 frames) without using too
-// much kernel memory with larger packet sizes. It also
-// can smooth over transient pauses in network traffic
-// and subsequent packet/frame bursts that follow.
-#define RTP_RECV_PACKETS_BUFFERED 2048
+static uint32_t getAdaptiveReceiveBufferPackets(void) {
+    uint32_t packetBytes = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
+    uint32_t baseBufferMs = (StreamConfig.streamingRemotely == STREAM_CFG_REMOTE) ?
+        RTP_RECV_BUFFER_TARGET_REMOTE_MS : RTP_RECV_BUFFER_TARGET_LOCAL_MS;
+    uint32_t rttVarianceMs = 0;
+
+    if (packetBytes == 0 || StreamConfig.bitrate <= 0 || StreamConfig.fps <= 0) {
+        return RTP_RECV_PACKETS_BUFFERED_DEFAULT;
+    }
+
+    if (LiGetEstimatedRttInfo(NULL, &rttVarianceMs)) {
+        uint32_t jitterMs = rttVarianceMs / 2;
+        if (jitterMs > RTP_RECV_BUFFER_JITTER_CAP_MS) {
+            jitterMs = RTP_RECV_BUFFER_JITTER_CAP_MS;
+        }
+        baseBufferMs += jitterMs;
+    }
+
+    if (baseBufferMs < RTP_RECV_BUFFER_TARGET_LOCAL_MS) {
+        baseBufferMs = RTP_RECV_BUFFER_TARGET_LOCAL_MS;
+    }
+
+    if (baseBufferMs > RTP_RECV_BUFFER_TARGET_REMOTE_MS + RTP_RECV_BUFFER_JITTER_CAP_MS) {
+        baseBufferMs = RTP_RECV_BUFFER_TARGET_REMOTE_MS + RTP_RECV_BUFFER_JITTER_CAP_MS;
+    }
+
+    {
+        uint64_t bytesPerSec = ((uint64_t)StreamConfig.bitrate * 1000) / 8;
+        uint64_t targetBytes = (bytesPerSec * baseBufferMs) / 1000;
+        uint32_t targetPackets = (uint32_t)((targetBytes + packetBytes - 1) / packetBytes);
+        // Keep a couple of frames buffered to avoid undersizing on bursty frame sizes.
+        uint64_t twoFrameBytes = (bytesPerSec * 2) / (uint64_t)StreamConfig.fps;
+        uint32_t minPackets = (uint32_t)((twoFrameBytes + packetBytes - 1) / packetBytes);
+        uint32_t packets = targetPackets;
+
+        if (minPackets < RTP_RECV_PACKETS_BUFFERED_MIN) {
+            minPackets = RTP_RECV_PACKETS_BUFFERED_MIN;
+        }
+
+        if (packets < minPackets) {
+            packets = minPackets;
+        }
+        if (packets > RTP_RECV_PACKETS_BUFFERED_MAX) {
+            packets = RTP_RECV_PACKETS_BUFFERED_MAX;
+        }
+
+        return packets;
+    }
+}
+
+static int getAdaptiveReceiveBufferBytes(void) {
+    uint32_t packetBytes = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
+    uint32_t packets = getAdaptiveReceiveBufferPackets();
+    uint64_t bufferBytes = (uint64_t)packets * packetBytes;
+
+    if (bufferBytes > INT_MAX) {
+        bufferBytes = INT_MAX;
+    }
+
+    return (int)bufferBytes;
+}
 
 // Initialize the video stream
 void initializeVideoStream(void) {
@@ -229,7 +287,7 @@ static void VideoReceiveThreadProc(void* context) {
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 
-        if (queueStatus == RTPF_RET_QUEUED) {
+        if (queueStatus == RTPF_RET_QUEUED || queueStatus == RTPF_RET_STASHED) {
             // The queue owns the buffer
             buffer = NULL;
         }
@@ -329,7 +387,7 @@ int startVideoStream(void* rendererContext, int drFlags) {
     }
 
     rtpSocket = bindUdpSocket(RemoteAddr.ss_family, &LocalAddr, AddrLen,
-                              RTP_RECV_PACKETS_BUFFERED * (StreamConfig.packetSize + MAX_RTP_HEADER_SIZE),
+                              getAdaptiveReceiveBufferBytes(),
                               SOCK_QOS_TYPE_VIDEO);
     if (rtpSocket == INVALID_SOCKET) {
         VideoCallbacks.cleanup();

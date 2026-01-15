@@ -865,6 +865,33 @@ int LiGetPendingAudioFrames(void);
 // negotiated audio frame duration.
 int LiGetPendingAudioDuration(void);
 
+// Returns the number of input packets waiting to be sent.
+int LiGetPendingInputPackets(void);
+
+// Returns input queue latency stats in milliseconds for queued input packets.
+typedef struct _INPUT_LATENCY_STATS {
+    uint64_t totalLatencyMs;
+    uint32_t packetCount;
+    uint32_t maxLatencyMs;
+    uint64_t totalMouseLatencyMs;
+    uint32_t mousePacketCount;
+    uint32_t maxMouseLatencyMs;
+    uint64_t totalKeyboardLatencyMs;
+    uint32_t keyboardPacketCount;
+    uint32_t maxKeyboardLatencyMs;
+    uint64_t totalControllerLatencyMs;
+    uint32_t controllerPacketCount;
+    uint32_t maxControllerLatencyMs;
+    uint64_t totalTouchLatencyMs;
+    uint32_t touchPacketCount;
+    uint32_t maxTouchLatencyMs;
+    uint64_t totalPenLatencyMs;
+    uint32_t penPacketCount;
+    uint32_t maxPenLatencyMs;
+} INPUT_LATENCY_STATS, *PINPUT_LATENCY_STATS;
+
+const INPUT_LATENCY_STATS* LiGetInputLatencyStats(void);
+
 // Returns a pointer to a struct containing various statistics about the RTP audio stream.
 // The data should be considered read-only and must not be modified.
 typedef struct _RTP_AUDIO_STATS {
